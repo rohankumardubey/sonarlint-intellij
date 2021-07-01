@@ -29,6 +29,8 @@ import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.Messages;
+import com.intellij.openapi.vcs.FileStatus;
+import com.intellij.openapi.vcs.FileStatusManager;
 import com.intellij.openapi.vfs.VirtualFile;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -45,12 +47,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.jetbrains.annotations.NotNull;
 import org.sonarlint.intellij.common.ui.SonarLintConsole;
+import org.sonarlint.intellij.config.Settings;
+import org.sonarlint.intellij.config.global.SonarLintGlobalSettings;
 import org.sonarlint.intellij.core.ServerIssueUpdater;
 import org.sonarlint.intellij.exception.InvalidBindingException;
 import org.sonarlint.intellij.issue.IssueManager;
 import org.sonarlint.intellij.issue.IssueMatcher;
-import org.sonarlint.intellij.issue.LiveIssueBuilder;
 import org.sonarlint.intellij.issue.LiveIssue;
+import org.sonarlint.intellij.issue.LiveIssueBuilder;
+import org.sonarlint.intellij.issue.SecretsNotifications;
 import org.sonarlint.intellij.issue.tracking.Trackable;
 import org.sonarlint.intellij.issue.vulnerabilities.TaintVulnerabilitiesPresenter;
 import org.sonarlint.intellij.trigger.TriggerType;
@@ -123,7 +128,19 @@ public class AnalysisTask extends Task.Backgroundable {
       // nothing to do, SonarLintEngineManager already showed notification
       return;
     }
-    List<VirtualFile> allFilesToAnalyze = filesByModule.entrySet().stream().flatMap(e -> e.getValue().stream()).collect(toList());
+    List<VirtualFile> allFiles = filesByModule.entrySet().stream().flatMap(e -> e.getValue().stream()).collect(toList());
+
+    FileStatusManager fileStatusManager = FileStatusManager.getInstance(myProject);
+    List<VirtualFile> ignoredFiles = new ArrayList<>();
+    List<VirtualFile> allFilesToAnalyze = new ArrayList<>();
+    allFiles.forEach(file -> {
+      if(fileStatusManager.getStatus(file) == FileStatus.IGNORED) {
+        ignoredFiles.add(file);
+        LOGGER.info("File " + file.getPath() + " is ignored in VCS and will no be analyzed.");
+      } else {
+        allFilesToAnalyze.add(file);
+      }
+    });
     // Cache everything that rely on issue store before clearing issues
     Map<VirtualFile, Boolean> firstAnalyzedFiles = cacheFirstAnalyzedFiles(manager, allFilesToAnalyze);
     Map<VirtualFile, Collection<Trackable>> previousIssuesPerFile = collectPreviousIssuesPerFile(manager, allFilesToAnalyze);
@@ -135,6 +152,7 @@ public class AnalysisTask extends Task.Backgroundable {
 
       ReadAction.run(() -> {
         Set<VirtualFile> filesToClear = new HashSet<>(filesToClearIssues);
+        filesToClear.addAll(ignoredFiles);
         filesToClear.addAll(allFilesToAnalyze);
         manager.clearAllIssuesForFiles(filesToClear);
       });
@@ -283,6 +301,12 @@ public class AnalysisTask extends Task.Backgroundable {
       Collection<Trackable> previousIssues = previousIssuesPerFile.get(vFile);
       LiveIssue locallyTrackedIssue = manager.trackSingleIssue(vFile, previousIssues, liveIssue);
       issuesPerFile.computeIfAbsent(vFile, f -> new ArrayList<>()).add(locallyTrackedIssue);
+    }
+
+    SonarLintGlobalSettings sonarLintGlobalSettings = Settings.getGlobalSettings();
+    if(sonarLintGlobalSettings.isSecretsNeverBeenAnalysed() && liveIssue.getRuleKey().contains("secrets")) {
+      SecretsNotifications.sendNotification(myProject);
+      sonarLintGlobalSettings.rememberNotificationOnSecretsBeenSent();
     }
   }
 
